@@ -161,7 +161,7 @@ LOCAL_PATH:= $(ROOT_DIR)
 
 # libOmxVdecHevc library is not built for OSS builds as QCPATH is null in OSS builds.
 
-ifneq "$(wildcard $(QCPATH) )" ""
+ifeq ($(WITH_OMX_HEVC),true)
 ifeq ($(call is-board-platform-in-list,msm8974 msm8610 apq8084 mpq8092 msm8226),true)
 
 LOCAL_MODULE                    := libOmxVdecHevc
