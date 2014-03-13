@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2010-2013, The Linux Foundation. All rights reserved.
+Copyright (c) 2010-2014, The Linux Foundation. All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
@@ -128,9 +128,8 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING role)
                 OMX_MAX_STRINGNAME_SIZE)) {
         strlcpy((char *)m_cRole, "video_encoder.avc",OMX_MAX_STRINGNAME_SIZE);
         codec_type = OMX_VIDEO_CodingAVC;
-    }
-    else if(!strncmp((char *)m_nkind, "OMX.qcom.video.encoder.avc.secure",\
-            OMX_MAX_STRINGNAME_SIZE)) {
+    } else if(!strncmp((char *)m_nkind, "OMX.qcom.video.encoder.avc.secure",\
+                OMX_MAX_STRINGNAME_SIZE)) {
         strlcpy((char *)m_cRole, "video_encoder.avc",OMX_MAX_STRINGNAME_SIZE);
         codec_type = OMX_VIDEO_CodingAVC;
         secure_session = true;
@@ -414,9 +413,18 @@ OMX_ERRORTYPE omx_venc::component_init(OMX_STRING role)
     m_sParamLTRMode.nPortIndex = (OMX_U32) PORT_INDEX_OUT;
     m_sParamLTRMode.eLTRMode = QOMX_VIDEO_LTRMode_Disable;
 
+    OMX_INIT_STRUCT(&m_sParamLTRCount, QOMX_VIDEO_PARAM_LTRCOUNT_TYPE);
+    m_sParamLTRCount.nPortIndex = (OMX_U32) PORT_INDEX_OUT;
+    m_sParamLTRCount.nCount = 0;
+
     OMX_INIT_STRUCT(&m_sConfigDeinterlace, OMX_VIDEO_CONFIG_DEINTERLACE);
     m_sConfigDeinterlace.nPortIndex = (OMX_U32) PORT_INDEX_OUT;
     m_sConfigDeinterlace.nEnable = OMX_FALSE;
+
+    OMX_INIT_STRUCT(&m_sHierLayers, QOMX_VIDEO_HIERARCHICALLAYERS);
+    m_sHierLayers.nPortIndex = (OMX_U32) PORT_INDEX_OUT;
+    m_sHierLayers.nNumLayers = 0;
+    m_sHierLayers.eHierarchicalCodingType = QOMX_HIERARCHICALCODING_P;
 
     m_state                   = OMX_StateLoaded;
     m_sExtraData = 0;
@@ -799,6 +807,12 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                     m_sParamAVC.eLevel = (OMX_VIDEO_AVCLEVELTYPE)m_sParamProfileLevel.eLevel;
                     DEBUG_PRINT_LOW("AVC profile = %d, level = %d", m_sParamAVC.eProfile,
                             m_sParamAVC.eLevel);
+                } else if (!strncmp((char *)m_nkind, "OMX.qcom.video.encoder.avc.secure",\
+                            OMX_MAX_STRINGNAME_SIZE)) {
+                    m_sParamAVC.eProfile = (OMX_VIDEO_AVCPROFILETYPE)m_sParamProfileLevel.eProfile;
+                    m_sParamAVC.eLevel = (OMX_VIDEO_AVCLEVELTYPE)m_sParamProfileLevel.eLevel;
+                    DEBUG_PRINT_LOW("\n AVC profile = %d, level = %d", m_sParamAVC.eProfile,
+                            m_sParamAVC.eLevel);
                 }
                 else if (!strncmp((char*)m_nkind, "OMX.qcom.video.encoder.vp8",\
                             OMX_MAX_STRINGNAME_SIZE)) {
@@ -829,6 +843,13 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                         strlcpy((char*)m_cRole,"video_encoder.avc",OMX_MAX_STRINGNAME_SIZE);
                     } else {
                         DEBUG_PRINT_ERROR("ERROR: Setparameter: unknown Index %s", comp_role->cRole);
+                        eRet =OMX_ErrorUnsupportedSetting;
+                    }
+                } else if (!strncmp((char*)m_nkind, "OMX.qcom.video.encoder.avc.secure",OMX_MAX_STRINGNAME_SIZE)) {
+                    if (!strncmp((char*)comp_role->cRole,"video_encoder.avc",OMX_MAX_STRINGNAME_SIZE)) {
+                        strlcpy((char*)m_cRole,"video_encoder.avc",OMX_MAX_STRINGNAME_SIZE);
+                    } else {
+                        DEBUG_PRINT_ERROR("ERROR: Setparameter: unknown Index %s\n", comp_role->cRole);
                         eRet =OMX_ErrorUnsupportedSetting;
                     }
                 } else if (!strncmp((char*)m_nkind, "OMX.qcom.video.encoder.mpeg4",OMX_MAX_STRINGNAME_SIZE)) {
@@ -1013,6 +1034,15 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                                     m_sOutPortDef.nPortIndex);
                         }
                     }
+                } else if (pParam->nPortIndex == PORT_INDEX_OUT && secure_session) {
+                    if (pParam->bStoreMetaData != meta_mode_enable) {
+                        if (!handle->venc_set_meta_mode(pParam->bStoreMetaData)) {
+                            DEBUG_PRINT_ERROR("\nERROR: set Metabuffer mode %d fail",
+                                    pParam->bStoreMetaData);
+                            return OMX_ErrorUnsupportedSetting;
+                        }
+                        meta_mode_enable = pParam->bStoreMetaData;
+                    }
                 } else {
                     DEBUG_PRINT_ERROR("set_parameter: metamode is "
                             "valid for input port only");
@@ -1026,63 +1056,48 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
             {
                 DEBUG_PRINT_HIGH("set_parameter: OMX_QcomIndexParamIndexExtraDataType");
                 QOMX_INDEXEXTRADATATYPE *pParam = (QOMX_INDEXEXTRADATATYPE *)paramData;
+                OMX_U32 mask = 0;
+
                 if (pParam->nIndex == (OMX_INDEXTYPE)OMX_ExtraDataVideoEncoderSliceInfo) {
                     if (pParam->nPortIndex == PORT_INDEX_OUT) {
-                        if (pParam->bEnabled == OMX_TRUE)
-                            m_sExtraData |= VEN_EXTRADATA_SLICEINFO;
-                        else
-                            m_sExtraData &= ~VEN_EXTRADATA_SLICEINFO;
+                        mask = VEN_EXTRADATA_SLICEINFO;
+
                         DEBUG_PRINT_HIGH("SliceInfo extradata %s",
                                 ((pParam->bEnabled == OMX_TRUE) ? "enabled" : "disabled"));
-                        if (handle->venc_set_param(&m_sExtraData,
-                                    (OMX_INDEXTYPE)OMX_ExtraDataVideoEncoderSliceInfo) != true) {
-                            DEBUG_PRINT_ERROR("ERROR: Setting "
-                                    "OMX_ExtraDataVideoEncoderSliceInfo failed");
-                            return OMX_ErrorUnsupportedSetting;
-                        } else {
-                            m_sOutPortDef.nPortIndex = PORT_INDEX_OUT;
-                            dev_get_buf_req(&m_sOutPortDef.nBufferCountMin,
-                                    &m_sOutPortDef.nBufferCountActual,
-                                    &m_sOutPortDef.nBufferSize,
-                                    m_sOutPortDef.nPortIndex);
-                            DEBUG_PRINT_HIGH("updated out_buf_req: buffer cnt=%lu, "
-                                    "count min=%lu, buffer size=%lu",
-                                    m_sOutPortDef.nBufferCountActual,
-                                    m_sOutPortDef.nBufferCountMin,
-                                    m_sOutPortDef.nBufferSize);
-                        }
+                    } else {
+                        DEBUG_PRINT_ERROR("set_parameter: Slice information is "
+                                "valid for output port only");
+                        eRet = OMX_ErrorUnsupportedIndex;
+                        break;
+                    }
+                }
+
+                if (pParam->nIndex == (OMX_INDEXTYPE)OMX_ExtraDataVideoEncoderMBInfo) {
+                    if (pParam->nPortIndex == PORT_INDEX_OUT) {
+                        mask = VEN_EXTRADATA_MBINFO;
+
+                        DEBUG_PRINT_HIGH("MBInfo extradata %s",
+                                ((pParam->bEnabled == OMX_TRUE) ? "enabled" : "disabled"));
+                    } else {
+                        DEBUG_PRINT_ERROR("set_parameter: MB information is "
+                                "valid for output port only");
+                        eRet = OMX_ErrorUnsupportedIndex;
+                        break;
                     }
                 }
 #ifndef _MSM8974_
                 else if (pParam->nIndex == (OMX_INDEXTYPE)OMX_ExtraDataVideoLTRInfo) {
                     if (pParam->nPortIndex == PORT_INDEX_OUT) {
                         if (pParam->bEnabled == OMX_TRUE)
-                            m_sExtraData |= VEN_EXTRADATA_LTRINFO;
-                        else
-                            m_sExtraData &= ~VEN_EXTRADATA_LTRINFO;
+                            mask = VEN_EXTRADATA_LTRINFO;
+
                         DEBUG_PRINT_HIGH("LTRInfo extradata %s",
                                 ((pParam->bEnabled == OMX_TRUE) ? "enabled" : "disabled"));
-                        if (handle->venc_set_param(&m_sExtraData,
-                                    (OMX_INDEXTYPE)OMX_ExtraDataVideoLTRInfo) != true) {
-                            DEBUG_PRINT_ERROR("ERROR: Setting "
-                                    "OMX_ExtraDataVideoLTRInfo failed");
-                            return OMX_ErrorUnsupportedSetting;
-                        } else {
-                            m_sOutPortDef.nPortIndex = PORT_INDEX_OUT;
-                            dev_get_buf_req(&m_sOutPortDef.nBufferCountMin,
-                                    &m_sOutPortDef.nBufferCountActual,
-                                    &m_sOutPortDef.nBufferSize,
-                                    m_sOutPortDef.nPortIndex);
-                            DEBUG_PRINT_HIGH("updated out_buf_req: buffer cnt=%d, "
-                                    "count min=%d, buffer size=%d",
-                                    m_sOutPortDef.nBufferCountActual,
-                                    m_sOutPortDef.nBufferCountMin,
-                                    m_sOutPortDef.nBufferSize);
-                        }
                     } else {
                         DEBUG_PRINT_ERROR("set_parameter: LTR information is "
                                 "valid for output port only");
                         eRet = OMX_ErrorUnsupportedIndex;
+                        break;
                     }
                 }
 #endif
@@ -1090,6 +1105,30 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                     DEBUG_PRINT_ERROR("set_parameter: unsupported extrdata index (%x)",
                             pParam->nIndex);
                     eRet = OMX_ErrorUnsupportedIndex;
+                    break;
+                }
+
+
+                if (pParam->bEnabled == OMX_TRUE)
+                    m_sExtraData |= mask;
+                else
+                    m_sExtraData &= ~mask;
+
+                if (handle->venc_set_param((OMX_PTR)!!(m_sExtraData & mask),
+                            (OMX_INDEXTYPE)pParam->nIndex) != true) {
+                    DEBUG_PRINT_ERROR("ERROR: Setting Extradata (%x) failed", pParam->nIndex);
+                    return OMX_ErrorUnsupportedSetting;
+                } else {
+                    m_sOutPortDef.nPortIndex = PORT_INDEX_OUT;
+                    dev_get_buf_req(&m_sOutPortDef.nBufferCountMin,
+                            &m_sOutPortDef.nBufferCountActual,
+                            &m_sOutPortDef.nBufferSize,
+                            m_sOutPortDef.nPortIndex);
+                    DEBUG_PRINT_HIGH("updated out_buf_req: buffer cnt=%lu, "
+                            "count min=%lu, buffer size=%lu",
+                            m_sOutPortDef.nBufferCountActual,
+                            m_sOutPortDef.nBufferCountMin,
+                            m_sOutPortDef.nBufferSize);
                 }
                 break;
             }
@@ -1191,6 +1230,27 @@ OMX_ERRORTYPE  omx_venc::set_parameter(OMX_IN OMX_HANDLETYPE     hComp,
                 }
                 break;
             }
+       case OMX_QcomIndexHierarchicalStructure:
+           {
+                QOMX_VIDEO_HIERARCHICALLAYERS* pParam =
+                    (QOMX_VIDEO_HIERARCHICALLAYERS*)paramData;
+                DEBUG_PRINT_LOW("OMX_QcomIndexHierarchicalStructure");
+                if (pParam->nPortIndex == PORT_INDEX_OUT) {
+                    if (!handle->venc_set_param(paramData,
+                                (OMX_INDEXTYPE)OMX_QcomIndexHierarchicalStructure)) {
+                        DEBUG_PRINT_ERROR("ERROR: Request for setting PlusPType failed");
+                        return OMX_ErrorUnsupportedSetting;
+                    }
+                    m_sHierLayers.nNumLayers = pParam->nNumLayers;
+                    m_sHierLayers.eHierarchicalCodingType = pParam->eHierarchicalCodingType;
+                } else {
+                    DEBUG_PRINT_ERROR("ERROR: OMX_QcomIndexHierarchicalStructure called on wrong port(%lu)",
+                          pParam->nPortIndex);
+                    return OMX_ErrorBadPortIndex;
+                }
+                break;
+
+           }
         case OMX_IndexParamVideoSliceFMO:
         default:
             {
@@ -1231,6 +1291,12 @@ bool omx_venc::update_profile_level()
         m_sParamAVC.eProfile = (OMX_VIDEO_AVCPROFILETYPE)eProfile;
         m_sParamAVC.eLevel = (OMX_VIDEO_AVCLEVELTYPE)eLevel;
         DEBUG_PRINT_LOW("AVC profile = %d, level = %d", m_sParamAVC.eProfile,
+                m_sParamAVC.eLevel);
+    } else if (!strncmp((char *)m_nkind, "OMX.qcom.video.encoder.avc.secure",\
+                OMX_MAX_STRINGNAME_SIZE)) {
+        m_sParamAVC.eProfile = (OMX_VIDEO_AVCPROFILETYPE)eProfile;
+        m_sParamAVC.eLevel = (OMX_VIDEO_AVCLEVELTYPE)eLevel;
+        DEBUG_PRINT_LOW("\n AVC profile = %d, level = %d", m_sParamAVC.eProfile,
                 m_sParamAVC.eLevel);
     }
     else if (!strncmp((char *)m_nkind, "OMX.qcom.video.encoder.vp8",\
@@ -1458,7 +1524,19 @@ OMX_ERRORTYPE  omx_venc::set_config(OMX_IN OMX_HANDLETYPE      hComp,
                 memcpy(&m_sConfigLTRPeriod, pParam, sizeof(m_sConfigLTRPeriod));
                 break;
             }
-        case QOMX_IndexConfigVideoLTRUse:
+
+       case OMX_IndexConfigVideoVp8ReferenceFrame:
+           {
+               OMX_VIDEO_VP8REFERENCEFRAMETYPE* pParam = (OMX_VIDEO_VP8REFERENCEFRAMETYPE*) configData;
+               if (!handle->venc_set_config(pParam, (OMX_INDEXTYPE) OMX_IndexConfigVideoVp8ReferenceFrame)) {
+                   DEBUG_PRINT_ERROR("ERROR: Setting VP8 reference frame");
+                   return OMX_ErrorUnsupportedSetting;
+               }
+               memcpy(&m_sConfigVp8ReferenceFrame, pParam, sizeof(m_sConfigVp8ReferenceFrame));
+               break;
+           }
+
+       case QOMX_IndexConfigVideoLTRUse:
             {
                 QOMX_VIDEO_CONFIG_LTRUSE_TYPE* pParam = (QOMX_VIDEO_CONFIG_LTRUSE_TYPE*)configData;
                 if (!handle->venc_set_config(configData, (OMX_INDEXTYPE)QOMX_IndexConfigVideoLTRUse)) {
@@ -1471,8 +1549,10 @@ OMX_ERRORTYPE  omx_venc::set_config(OMX_IN OMX_HANDLETYPE      hComp,
         case QOMX_IndexConfigVideoLTRMark:
             {
                 QOMX_VIDEO_CONFIG_LTRMARK_TYPE* pParam = (QOMX_VIDEO_CONFIG_LTRMARK_TYPE*)configData;
-                DEBUG_PRINT_ERROR("Setting ltr mark is not supported");
-                return OMX_ErrorUnsupportedSetting;
+                if (!handle->venc_set_config(configData, (OMX_INDEXTYPE)QOMX_IndexConfigVideoLTRMark)) {
+                    DEBUG_PRINT_ERROR("ERROR: Setting LTR mark failed");
+                    return OMX_ErrorUnsupportedSetting;
+                }
                 break;
             }
         case OMX_IndexConfigVideoAVCIntraPeriod:

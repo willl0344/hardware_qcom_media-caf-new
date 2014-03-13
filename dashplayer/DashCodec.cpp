@@ -247,6 +247,8 @@ private:
 struct DashCodec::ExecutingState : public DashCodec::BaseState {
     ExecutingState(DashCodec *codec);
 
+    void submitRegularOutputBuffers();
+    void submitOutputMetaBuffers();
     void submitOutputBuffers();
 
     // Submit output buffers to the decoder, submit input buffers to client
@@ -380,7 +382,10 @@ DashCodec::DashCodec()
       mEncoderPadding(0),
       mChannelMaskPresent(false),
       mChannelMask(0),
-      mSmoothStreaming(false) {
+      mDequeueCounter(0),
+      mStoreMetaDataInOutputBuffers(false),
+      mMetaDataBuffersToSubmit(0),
+      mAdaptivePlayback(false) {
     mUninitializedState = new UninitializedState(this);
     mLoadedState = new LoadedState(this);
     mLoadedToIdleState = new LoadedToIdleState(this);
@@ -458,7 +463,11 @@ status_t DashCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
 
     status_t err;
     if (mNativeWindow != NULL && portIndex == kPortIndexOutput) {
+        if (mStoreMetaDataInOutputBuffers) {
+            err = allocateOutputMetaDataBuffers();
+        } else {
         err = allocateOutputBuffersFromNativeWindow();
+        }
     } else {
         OMX_PARAM_PORTDEFINITIONTYPE def;
         InitOMXParams(&def);
@@ -536,7 +545,9 @@ status_t DashCodec::allocateBuffersOnPort(OMX_U32 portIndex) {
     return OK;
 }
 
-status_t DashCodec::allocateOutputBuffersFromNativeWindow() {
+status_t DashCodec::configureOutputBuffersFromNativeWindow(
+OMX_U32 *bufferCount, OMX_U32 *bufferSize,
+        OMX_U32 *minUndequeuedBuffers) {
     OMX_PARAM_PORTDEFINITIONTYPE def;
     InitOMXParams(&def);
     def.nPortIndex = kPortIndexOutput;
@@ -601,10 +612,10 @@ status_t DashCodec::allocateOutputBuffersFromNativeWindow() {
         return err;
     }
 
-    int minUndequeuedBufs = 0;
+    *minUndequeuedBuffers = 0;
     err = mNativeWindow->query(
             mNativeWindow.get(), NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS,
-            &minUndequeuedBufs);
+            (int *)minUndequeuedBuffers);
 
     if (err != 0) {
         ALOGE("NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS query failed: %s (%d)",
@@ -615,15 +626,14 @@ status_t DashCodec::allocateOutputBuffersFromNativeWindow() {
     // XXX: Is this the right logic to use?  It's not clear to me what the OMX
     // buffer counts refer to - how do they account for the renderer holding on
     // to buffers?
-    if (def.nBufferCountActual < def.nBufferCountMin + minUndequeuedBufs) {
-        OMX_U32 newBufferCount = def.nBufferCountMin + minUndequeuedBufs;
+    if (def.nBufferCountActual < def.nBufferCountMin + *minUndequeuedBuffers) {
+        OMX_U32 newBufferCount = def.nBufferCountMin + *minUndequeuedBuffers;
         def.nBufferCountActual = newBufferCount;
-#ifdef ANDROID_JB_MR2
+
         //Keep an extra buffer for smooth streaming
-        if (mSmoothStreaming) {
+        if (mAdaptivePlayback) {
             def.nBufferCountActual += 1;
         }
-#endif
 
         err = mOMX->setParameter(
                 mNode, OMX_IndexParamPortDefinition, &def, sizeof(def));
@@ -645,12 +655,24 @@ status_t DashCodec::allocateOutputBuffersFromNativeWindow() {
         return err;
     }
 
+    *bufferCount = def.nBufferCountActual;
+    *bufferSize =  def.nBufferSize;
+    return err;
+}
+
+status_t DashCodec::allocateOutputBuffersFromNativeWindow() {
+    OMX_U32 bufferCount, bufferSize, minUndequeuedBuffers;
+    status_t err = configureOutputBuffersFromNativeWindow(
+            &bufferCount, &bufferSize, &minUndequeuedBuffers);
+    if (err != 0)
+        return err;
+
     ALOGV("[%s] Allocating %lu buffers from a native window of size %lu on "
          "output port",
-         mComponentName.c_str(), def.nBufferCountActual, def.nBufferSize);
+         mComponentName.c_str(), bufferCount, bufferSize);
 
     // Dequeue buffers and send them to OMX
-    for (OMX_U32 i = 0; i < def.nBufferCountActual; i++) {
+    for (OMX_U32 i = 0; i < bufferCount; i++) {
         ANativeWindowBuffer *buf;
         err = native_window_dequeue_buffer_and_wait(mNativeWindow.get(), &buf);
         if (err != 0) {
@@ -661,7 +683,7 @@ status_t DashCodec::allocateOutputBuffersFromNativeWindow() {
         sp<GraphicBuffer> graphicBuffer(new GraphicBuffer(buf, false));
         BufferInfo info;
         info.mStatus = BufferInfo::OWNED_BY_US;
-        info.mData = new ABuffer(0);
+        info.mData = new ABuffer(NULL /* data */, bufferSize /* capacity */);
         info.mGraphicBuffer = graphicBuffer;
         mBuffers[kPortIndexOutput].push(info);
 
@@ -690,9 +712,9 @@ status_t DashCodec::allocateOutputBuffersFromNativeWindow() {
         cancelStart = 0;
         cancelEnd = mBuffers[kPortIndexOutput].size();
     } else {
-        // Return the last two buffers to the native window.
-        cancelStart = def.nBufferCountActual - minUndequeuedBufs;
-        cancelEnd = def.nBufferCountActual;
+        // Return the required minimum undequeued buffers to the native window.
+        cancelStart = bufferCount - minUndequeuedBuffers;
+        cancelEnd = bufferCount;
     }
 
     for (OMX_U32 i = cancelStart; i < cancelEnd; i++) {
@@ -701,6 +723,65 @@ status_t DashCodec::allocateOutputBuffersFromNativeWindow() {
     }
 
     return err;
+}
+
+status_t DashCodec::allocateOutputMetaDataBuffers() {
+    OMX_U32 bufferCount, bufferSize, minUndequeuedBuffers;
+    status_t err = configureOutputBuffersFromNativeWindow(
+            &bufferCount, &bufferSize, &minUndequeuedBuffers);
+    if (err != 0)
+        return err;
+
+    ALOGV("[%s] Allocating %lu meta buffers on output port",
+         mComponentName.c_str(), bufferCount);
+
+    size_t totalSize = bufferCount * 8;
+    mDealer[kPortIndexOutput] = new MemoryDealer(totalSize, "DashCodec");
+
+    // Dequeue buffers and send them to OMX
+    for (OMX_U32 i = 0; i < bufferCount; i++) {
+        BufferInfo info;
+        info.mStatus = BufferInfo::OWNED_BY_NATIVE_WINDOW;
+        info.mGraphicBuffer = NULL;
+        info.mDequeuedAt = mDequeueCounter;
+
+        sp<IMemory> mem = mDealer[kPortIndexOutput]->allocate(
+                sizeof(struct VideoDecoderOutputMetaData));
+        CHECK(mem.get() != NULL);
+        info.mData = new ABuffer(mem->pointer(), mem->size());
+
+        // we use useBuffer for metadata regardless of quirks
+        err = mOMX->useBuffer(
+                mNode, kPortIndexOutput, mem, &info.mBufferID);
+
+        mBuffers[kPortIndexOutput].push(info);
+
+        ALOGV("[%s] allocated meta buffer with ID %p (pointer = %p)",
+             mComponentName.c_str(), info.mBufferID, mem->pointer());
+    }
+
+    mMetaDataBuffersToSubmit = bufferCount - minUndequeuedBuffers;
+    return err;
+}
+
+status_t DashCodec::submitOutputMetaDataBuffer() {
+    CHECK(mStoreMetaDataInOutputBuffers);
+    if (mMetaDataBuffersToSubmit == 0)
+        return OK;
+
+    BufferInfo *info = dequeueBufferFromNativeWindow();
+    if (info == NULL)
+        return ERROR_IO;
+
+    ALOGV("[%s] submitting output meta buffer ID %p for graphic buffer %p",
+          mComponentName.c_str(), info->mBufferID, info->mGraphicBuffer.get());
+
+    --mMetaDataBuffersToSubmit;
+    CHECK_EQ(mOMX->fillBuffer(mNode, info->mBufferID),
+             (status_t)OK);
+
+    info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+    return OK;
 }
 
 status_t DashCodec::cancelBufferToNativeWindow(BufferInfo *info) {
@@ -722,16 +803,19 @@ status_t DashCodec::cancelBufferToNativeWindow(BufferInfo *info) {
 DashCodec::BufferInfo *DashCodec::dequeueBufferFromNativeWindow() {
     ANativeWindowBuffer *buf;
     int fenceFd = -1;
+    CHECK(mNativeWindow.get() != NULL);
     if (native_window_dequeue_buffer_and_wait(mNativeWindow.get(), &buf) != 0) {
         ALOGE("dequeueBuffer failed.");
         return NULL;
     }
 
+    BufferInfo *oldest = NULL;
     for (size_t i = mBuffers[kPortIndexOutput].size(); i-- > 0;) {
         BufferInfo *info =
             &mBuffers[kPortIndexOutput].editItemAt(i);
 
-        if (info->mGraphicBuffer->handle == buf->handle) {
+        if (info->mGraphicBuffer != NULL &&
+            info->mGraphicBuffer->handle == buf->handle) {
             CHECK_EQ((int)info->mStatus,
                      (int)BufferInfo::OWNED_BY_NATIVE_WINDOW);
 
@@ -739,6 +823,38 @@ DashCodec::BufferInfo *DashCodec::dequeueBufferFromNativeWindow() {
 
             return info;
         }
+
+        if (info->mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW &&
+            (oldest == NULL ||
+             // avoid potential issues from counter rolling over
+             mDequeueCounter - info->mDequeuedAt >
+                    mDequeueCounter - oldest->mDequeuedAt)) {
+            oldest = info;
+        }
+    }
+
+    if (oldest) {
+        CHECK(mStoreMetaDataInOutputBuffers);
+
+        // discard buffer in LRU info and replace with new buffer
+        oldest->mGraphicBuffer = new GraphicBuffer(buf, false);
+        oldest->mStatus = BufferInfo::OWNED_BY_US;
+
+        mOMX->updateGraphicBufferInMeta(
+                  mNode, kPortIndexOutput, oldest->mGraphicBuffer,
+                  oldest->mBufferID);
+        VideoDecoderOutputMetaData *metaData =
+                      reinterpret_cast<VideoDecoderOutputMetaData *>(
+                      oldest->mData->base());
+        CHECK_EQ(metaData->eType, kMetadataBufferTypeGrallocSource);
+
+        ALOGV("replaced oldest buffer #%u with age %u (%p/%p stored in %p)",
+                oldest - &mBuffers[kPortIndexOutput][0],
+                mDequeueCounter - oldest->mDequeuedAt,
+                metaData->pHandle,
+                oldest->mGraphicBuffer->handle, oldest->mData->base());
+
+        return oldest;
     }
 
     TRESPASS();
@@ -761,12 +877,10 @@ status_t DashCodec::freeOutputBuffersNotOwnedByComponent() {
         BufferInfo *info =
             &mBuffers[kPortIndexOutput].editItemAt(i);
 
-        if (info->mStatus !=
-                BufferInfo::OWNED_BY_COMPONENT) {
-            // We shouldn't have sent out any buffers to the client at this
-            // point.
-            CHECK_NE((int)info->mStatus, (int)BufferInfo::OWNED_BY_DOWNSTREAM);
-
+        // At this time some buffers may still be with the component
+        // or being drained.
+        if (info->mStatus != BufferInfo::OWNED_BY_COMPONENT &&
+            info->mStatus != BufferInfo::OWNED_BY_DOWNSTREAM) {
             CHECK_EQ((status_t)OK, freeBuffer(kPortIndexOutput, i));
         }
     }
@@ -933,6 +1047,10 @@ status_t DashCodec::configureCodec(
 
             return err;
         }
+        else
+        {
+          ALOGE("[%s] storeMetaDataInBuffers succedded", mComponentName.c_str());
+        }
     }
 
     int32_t prependSPSPPS;
@@ -964,13 +1082,12 @@ status_t DashCodec::configureCodec(
 
     // Always try to enable dynamic output buffers on native surface
     int32_t video = !strncasecmp(mime, "video/", 6);
-#ifndef ANDROID_JB_MR2
       sp<RefBase> obj;
       int32_t haveNativeWindow = msg->findObject("native-window", &obj) &&
             obj != NULL;
+    mStoreMetaDataInOutputBuffers = false;
       if (!encoder && video && haveNativeWindow) {
-        //err = mOMX->storeMetaDataInBuffers(mNode, kPortIndexOutput, OMX_TRUE);
-        err = INVALID_OPERATION;
+        err = mOMX->storeMetaDataInBuffers(mNode, kPortIndexOutput, OMX_TRUE);
         if (err != OK) {
 
             ALOGE("[%s] storeMetaDataInBuffers failed w/ err %d",
@@ -984,7 +1101,6 @@ status_t DashCodec::configureCodec(
             // surfaces as they never had to respond to changes in the
             // crop window, and we don't trust that they will be able to.
             int usageBits = 0;
-            bool canDoAdaptivePlayback;
 
             sp<NativeWindowWrapper> windowWrapper(
                     static_cast<NativeWindowWrapper *>(obj.get()));
@@ -994,35 +1110,39 @@ status_t DashCodec::configureCodec(
                     nativeWindow.get(),
                     NATIVE_WINDOW_CONSUMER_USAGE_BITS,
                     &usageBits) != OK) {
-                canDoAdaptivePlayback = false;
             } else {
-                canDoAdaptivePlayback =
+                mAdaptivePlayback =
                     (usageBits &
                             (GRALLOC_USAGE_SW_READ_MASK |
                              GRALLOC_USAGE_SW_WRITE_MASK)) == 0;
             }
-
-            int32_t maxWidth = 0, maxHeight = 0;
-            if (canDoAdaptivePlayback &&
-                msg->findInt32("max-width", &maxWidth) &&
-                msg->findInt32("max-height", &maxHeight)) {
+            int32_t maxWidth = MAX_WIDTH;
+            int32_t maxHeight = MAX_HEIGHT;
+            if (mAdaptivePlayback) {
                 ALOGV("[%s] prepareForAdaptivePlayback(%ldx%ld)",
                       mComponentName.c_str(), maxWidth, maxHeight);
 
                 err = mOMX->prepareForAdaptivePlayback(
                         mNode, kPortIndexOutput, OMX_TRUE, maxWidth, maxHeight);
-                ALOGW_IF(err != OK,
-                        "[%s] prepareForAdaptivePlayback failed w/ err %d",
+                if (err != OK)
+                {
+                  ALOGE("[%s] prepareForAdaptivePlayback failed w/ err %d",
+                         mComponentName.c_str(), err);
+                }
+                else
+                {
+                  ALOGV("[%s] prepareForAdaptivePlayback : Success",
                         mComponentName.c_str(), err);
             }
+          }
             // allow failure
             err = OK;
         } else {
             ALOGV("[%s] storeMetaDataInBuffers succeeded", mComponentName.c_str());
+            mStoreMetaDataInOutputBuffers = true;
         }
       }
-#endif
-    if (video) {
+    if (!strncasecmp(mime, "video/", 6)) {
         if (encoder) {
             err = setupVideoEncoder(mime, msg);
         } else {
@@ -1032,12 +1152,10 @@ status_t DashCodec::configureCodec(
                 err = INVALID_OPERATION;
             } else {
                 //override height & width with max for smooth streaming
-#ifdef ANDROID_JB_MR2
-                if (mSmoothStreaming) {
+                if (mAdaptivePlayback) {
                     width = MAX_WIDTH;
                     height = MAX_HEIGHT;
                 }
-#endif
                 err = setupVideoDecoder(mime, width, height);
             }
         }
@@ -2153,6 +2271,46 @@ size_t DashCodec::countBuffersOwnedByComponent(OMX_U32 portIndex) const {
     return n;
 }
 
+size_t DashCodec::countBuffersOwnedByNativeWindow() const {
+    size_t n = 0;
+
+    for (size_t i = 0; i < mBuffers[kPortIndexOutput].size(); ++i) {
+        const BufferInfo &info = mBuffers[kPortIndexOutput].itemAt(i);
+
+        if (info.mStatus == BufferInfo::OWNED_BY_NATIVE_WINDOW) {
+            ++n;
+        }
+    }
+
+    return n;
+}
+
+void DashCodec::waitUntilAllPossibleNativeWindowBuffersAreReturnedToUs() {
+    if (mNativeWindow == NULL) {
+        return;
+    }
+
+    int minUndequeuedBufs = 0;
+    status_t err = mNativeWindow->query(
+            mNativeWindow.get(), NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS,
+            &minUndequeuedBufs);
+
+    if (err != OK) {
+        ALOGE("[%s] NATIVE_WINDOW_MIN_UNDEQUEUED_BUFFERS query failed: %s (%d)",
+                mComponentName.c_str(), strerror(-err), -err);
+
+        minUndequeuedBufs = 0;
+    }
+
+    while (countBuffersOwnedByNativeWindow() > (size_t)minUndequeuedBufs
+            && dequeueBufferFromNativeWindow() != NULL) {
+        // these buffers will be submitted as regular buffers; account for this
+        if (mStoreMetaDataInOutputBuffers && mMetaDataBuffersToSubmit > 0) {
+            --mMetaDataBuffersToSubmit;
+        }
+    }
+}
+
 bool DashCodec::allYourBuffersAreBelongToUs(
         OMX_U32 portIndex) {
     for (size_t i = 0; i < mBuffers[portIndex].size(); ++i) {
@@ -2295,20 +2453,6 @@ void DashCodec::sendFormatChange() {
             CHECK_LE(rect->nLeft + rect->nWidth - 1, videoDef->nFrameWidth);
             CHECK_LE(rect->nTop + rect->nHeight - 1, videoDef->nFrameHeight);
 
-#ifdef ANDROID_JB_MR2
-            if( mSmoothStreaming ) {
-               //call Update buffer geometry here
-                ALOGE("Calling native window update buffer geometry");
-                status_t err = mNativeWindow.get()->perform(mNativeWindow.get(),
-                                         NATIVE_WINDOW_UPDATE_BUFFERS_GEOMETRY,
-                                         videoDef->nFrameWidth, videoDef->nFrameHeight, def->format.video.eColorFormat);
-               if( err != OK ) {
-                   ALOGE("native_window_update_buffers_geometry failed in SS mode %d", err);
-               }
-
-           }
-#endif
-
             notify->setRect(
                     "crop",
                     rect->nLeft,
@@ -2378,18 +2522,6 @@ void DashCodec::sendFormatChange() {
     notify->post();
     delete def;
     mSentFormat = true;
-}
-
-status_t DashCodec::InitSmoothStreaming() {
-     status_t err = mOMX->setParameter(mNode, (OMX_INDEXTYPE)OMX_QcomIndexParamEnableSmoothStreaming,&err, sizeof(int32_t));
-    if (err != OMX_ErrorNone) {
-        ALOGE("InitSmoothStreaming setParam failed for extradata");
-        return err;
-    }
-
-    ALOGW("InitSmoothStreaming - Smooth streaming mode enabled");
-
-    return OK;
 }
 
 void DashCodec::signalError(OMX_ERRORTYPE error, status_t internalError) {
@@ -2879,6 +3011,20 @@ void DashCodec::BaseState::onInputBufferFilled(const sp<AMessage> &msg) {
                 mCodec->mBufferStats.add(timeUs, stats);
 #endif
 
+                if (mCodec->mStoreMetaDataInOutputBuffers) {
+                    // try to submit an output buffer for each input buffer
+                    PortMode outputMode = getPortMode(kPortIndexOutput);
+
+                    ALOGV("MetaDataBuffersToSubmit=%u portMode=%s",
+                            mCodec->mMetaDataBuffersToSubmit,
+                            (outputMode == FREE_BUFFERS ? "FREE" :
+                             outputMode == KEEP_BUFFERS ? "KEEP" : "RESUBMIT"));
+                    if (outputMode == RESUBMIT_BUFFERS) {
+                        CHECK_EQ(mCodec->submitOutputMetaDataBuffer(),
+                                (status_t)OK);
+                    }
+                }
+
                 CHECK_EQ(mCodec->mOMX->emptyBuffer(
                             mCodec->mNode,
                             bufferID,
@@ -2996,6 +3142,7 @@ bool DashCodec::BaseState::onOMXFillBufferDone(
 
     CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_COMPONENT);
 
+    info->mDequeuedAt = ++mCodec->mDequeueCounter;
     info->mStatus = BufferInfo::OWNED_BY_US;
 
     PortMode mode = getPortMode(kPortIndexOutput);
@@ -3029,11 +3176,7 @@ bool DashCodec::BaseState::onOMXFillBufferDone(
                 mCodec->mPortEOS[kPortIndexOutput] = true;
                 break;
             }
-#ifdef ANDROID_JB_MR2
-            if (!mCodec->mIsEncoder && !mCodec->mSentFormat && !mCodec->mSmoothStreaming) {
-#else
-            if (!mCodec->mIsEncoder && !mCodec->mSentFormat) {
-#endif
+            if (!mCodec->mIsEncoder && !mCodec->mSentFormat && !mCodec->mAdaptivePlayback) {
                 mCodec->sendFormatChange();
             }
 
@@ -3059,13 +3202,12 @@ bool DashCodec::BaseState::onOMXFillBufferDone(
             notify->setInt32("flags", flags);
             sp<AMessage> reply =
                 new AMessage(kWhatOutputBufferDrained, mCodec->id());
-#ifdef ANDROID_JB_MR2
-           if (!mCodec->mPostFormat && mCodec->mSmoothStreaming){
+
+           if (!mCodec->mPostFormat && mCodec->mAdaptivePlayback){
                    ALOGV("Resolution will change from this buffer, set a flag");
                    reply->setInt32("resChange", 1);
                    mCodec->mPostFormat = true;
             }
-#endif
 
             reply->setPointer("buffer-id", info->mBufferID);
 
@@ -3099,8 +3241,7 @@ void DashCodec::BaseState::onOutputBufferDrained(const sp<AMessage> &msg) {
     BufferInfo *info =
         mCodec->findBufferByID(kPortIndexOutput, bufferID, &index);
     CHECK_EQ((int)info->mStatus, (int)BufferInfo::OWNED_BY_DOWNSTREAM);
-#ifdef ANDROID_JB_MR2
-    if (mCodec->mSmoothStreaming) {
+    if (mCodec->mAdaptivePlayback) {
         int32_t resChange = 0;
         if (msg->findInt32("resChange", &resChange) && resChange == 1) {
             ALOGV("Resolution change is sent to native window now ");
@@ -3108,7 +3249,6 @@ void DashCodec::BaseState::onOutputBufferDrained(const sp<AMessage> &msg) {
             msg->setInt32("resChange", 0);
         }
     }
-#endif
     int32_t render;
     if (mCodec->mNativeWindow != NULL
             && msg->findInt32("render", &render) && render != 0) {
@@ -3350,6 +3490,9 @@ DashCodec::LoadedState::LoadedState(DashCodec *codec)
 void DashCodec::LoadedState::stateEntered() {
     ALOGV("[%s] Now Loaded", mCodec->mComponentName.c_str());
 
+mCodec->mDequeueCounter = 0;
+    mCodec->mMetaDataBuffersToSubmit = 0;
+
     if (mCodec->mShutdownInProgress) {
         bool keepComponentAllocated = mCodec->mKeepComponentAllocated;
 
@@ -3423,27 +3566,6 @@ bool DashCodec::LoadedState::onConfigureComponent(
     CHECK(mCodec->mNode != NULL);
 
     int32_t value;
-#ifdef ANDROID_JB_MR2
-    if (msg->findInt32("smooth-streaming", &value) && (value == 1) &&
-       !strcmp("OMX.qcom.video.decoder.avc", mCodec->mComponentName.c_str())) {
-
-        char value_ss[PROPERTY_VALUE_MAX];
-        if (property_get("hls.disable.smooth.streaming", value_ss, NULL) &&
-           (!strcasecmp(value_ss, "true") || !strcmp(value_ss, "1"))) {
-
-            ALOGW("Dont enable Smooth streaming, disable property is set");
-        } else {
-            mCodec->mSmoothStreaming = true;
-            status_t err = mCodec->InitSmoothStreaming();
-            if (err != OK) {
-                ALOGE("Error in enabling smooth streaming, ignore & disable ");
-                mCodec->mSmoothStreaming = false;
-            } else {
-                ALOGI("Smooth streaming is enabled ");
-            }
-        }
-    }
-#endif
 
     if (msg->findInt32("secure-op", &value) && (value == 1)) {
         mCodec->mFlags |= kFlagIsSecureOPOnly;
@@ -3615,7 +3737,20 @@ DashCodec::BaseState::PortMode DashCodec::ExecutingState::getPortMode(
     return RESUBMIT_BUFFERS;
 }
 
-void DashCodec::ExecutingState::submitOutputBuffers() {
+void DashCodec::ExecutingState::submitOutputMetaBuffers() {
+    // submit as many buffers as there are input buffers with the codec
+    // in case we are in port reconfiguring
+    for (size_t i = 0; i < mCodec->mBuffers[kPortIndexInput].size(); ++i) {
+        BufferInfo *info = &mCodec->mBuffers[kPortIndexInput].editItemAt(i);
+
+        if (info->mStatus == BufferInfo::OWNED_BY_COMPONENT) {
+            if (mCodec->submitOutputMetaDataBuffer() != OK)
+                break;
+        }
+    }
+}
+
+void DashCodec::ExecutingState::submitRegularOutputBuffers() {
     for (size_t i = 0; i < mCodec->mBuffers[kPortIndexOutput].size(); ++i) {
         BufferInfo *info = &mCodec->mBuffers[kPortIndexOutput].editItemAt(i);
 
@@ -3637,6 +3772,13 @@ void DashCodec::ExecutingState::submitOutputBuffers() {
                  (status_t)OK);
 
         info->mStatus = BufferInfo::OWNED_BY_COMPONENT;
+    }
+}
+
+void DashCodec::ExecutingState::submitOutputBuffers() {
+    submitRegularOutputBuffers();
+    if (mCodec->mStoreMetaDataInOutputBuffers) {
+        submitOutputMetaBuffers();
     }
 }
 
@@ -3747,12 +3889,25 @@ bool DashCodec::ExecutingState::onOMXEvent(
             CHECK_EQ(data1, (OMX_U32)kPortIndexOutput);
 
             if (data2 == 0 || data2 == OMX_IndexParamPortDefinition) {
-                ALOGV("Flush output port before disable");
-                CHECK_EQ(mCodec->mOMX->sendCommand(
+                if (mCodec->mStoreMetaDataInOutputBuffers) {
+                    ALOGE("[%s] storeMetaDataInBuffers:Rcvd port settings changed event..disabling outputport",
+                          mCodec->mComponentName.c_str());
+mCodec->mMetaDataBuffersToSubmit = 0;
+                    CHECK_EQ(mCodec->mOMX->sendCommand(
+                                mCodec->mNode,
+                                OMX_CommandPortDisable, kPortIndexOutput),
+                             (status_t)OK);
+
+                    mCodec->freeOutputBuffersNotOwnedByComponent();
+                    mCodec->changeState(mCodec->mOutputPortSettingsChangedState);
+                }else {
+                  ALOGV("Flush output port before disable");
+                  CHECK_EQ(mCodec->mOMX->sendCommand(
                         mCodec->mNode, OMX_CommandFlush, kPortIndexOutput),
                      (status_t)OK);
 
-                mCodec->changeState(mCodec->mFlushingOutputState);
+                  mCodec->changeState(mCodec->mFlushingOutputState);
+                }
 
             } else if (data2 == OMX_IndexConfigCommonOutputCrop) {
                 mCodec->mSentFormat = false;
@@ -4143,6 +4298,10 @@ void DashCodec::FlushingState::changeStateIfWeOwnAllBuffers() {
     if (mFlushComplete[kPortIndexInput]
             && mFlushComplete[kPortIndexOutput]
             && mCodec->allYourBuffersAreBelongToUs()) {
+        // We now own all buffers except possibly those still queued with
+        // the native window for rendering. Let's get those back as well.
+        mCodec->waitUntilAllPossibleNativeWindowBuffersAreReturnedToUs();
+
         sp<AMessage> notify = mCodec->mNotify->dup();
         notify->setInt32("what", DashCodec::kWhatFlushCompleted);
         notify->post();

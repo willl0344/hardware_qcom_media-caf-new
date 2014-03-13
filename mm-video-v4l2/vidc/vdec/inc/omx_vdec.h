@@ -1,5 +1,5 @@
 /*--------------------------------------------------------------------------
-Copyright (c) 2010 - 2013, The Linux Foundation. All rights reserved.
+Copyright (c) 2010 - 2014, The Linux Foundation. All rights reserved.
 
   Redistribution and use in source and binary forms, with or without
   modification, are permitted provided that the following conditions
@@ -186,6 +186,8 @@ class VideoHeap : public MemoryHeapBase
 #define OMX_PORTDEF_EXTRADATA   0x00080000
 #define OMX_EXTNUSER_EXTRADATA  0x00100000
 #define OMX_FRAMEPACK_EXTRADATA 0x00400000
+#define OMX_QP_EXTRADATA        0x00800000
+#define OMX_BITSINFO_EXTRADATA  0x01000000
 #define DRIVER_EXTRADATA_MASK   0x0000FFFF
 
 #define OMX_INTERLACE_EXTRADATA_SIZE ((sizeof(OMX_OTHER_EXTRADATATYPE) +\
@@ -196,6 +198,10 @@ class VideoHeap : public MemoryHeapBase
             sizeof(OMX_PARAM_PORTDEFINITIONTYPE) + 3)&(~3))
 #define OMX_FRAMEPACK_EXTRADATA_SIZE ((sizeof(OMX_OTHER_EXTRADATATYPE) +\
             sizeof(OMX_QCOM_FRAME_PACK_ARRANGEMENT) + 3)&(~3))
+#define OMX_QP_EXTRADATA_SIZE ((sizeof(OMX_OTHER_EXTRADATATYPE) +\
+            sizeof(OMX_QCOM_EXTRADATA_QP) + 3)&(~3))
+#define OMX_BITSINFO_EXTRADATA_SIZE ((sizeof(OMX_OTHER_EXTRADATATYPE) +\
+            sizeof(OMX_QCOM_EXTRADATA_BITS_INFO) + 3)&(~3))
 
 //  Define next macro with required values to enable default extradata,
 //    VDEC_EXTRADATA_MB_ERROR_MAP
@@ -661,6 +667,10 @@ class omx_vdec: public qc_omx_component
                 OMX_OTHER_EXTRADATATYPE *p_concealmb, OMX_U8 *conceal_mb_data);
         void append_framepack_extradata(OMX_OTHER_EXTRADATATYPE *extra,
                 struct msm_vidc_s3d_frame_packing_payload *s3d_frame_packing_payload);
+        void append_qp_extradata(OMX_OTHER_EXTRADATATYPE *extra,
+                struct msm_vidc_frame_qp_payload *qp_payload);
+        void append_bitsinfo_extradata(OMX_OTHER_EXTRADATATYPE *extra,
+                struct msm_vidc_frame_bits_info_payload *bits_payload);
         void insert_demux_addr_offset(OMX_U32 address_offset);
         void extract_demux_addr_offsets(OMX_BUFFERHEADERTYPE *buf_hdr);
         OMX_ERRORTYPE handle_demux_data(OMX_BUFFERHEADERTYPE *buf_hdr);
@@ -861,6 +871,7 @@ class omx_vdec: public qc_omx_component
         bool m_use_android_native_buffers;
         bool m_debug_extradata;
         bool m_debug_concealedmb;
+        OMX_U32 m_conceal_color;
 #endif
 #ifdef MAX_RES_1080P
         MP4_Utils mp4_headerparser;
@@ -907,6 +918,7 @@ class omx_vdec: public qc_omx_component
         bool is_down_scalar_enabled;
 #endif
         bool m_power_hinted;
+        bool is_q6_platform;
         OMX_ERRORTYPE power_module_register();
         OMX_ERRORTYPE power_module_deregister();
         bool msg_thread_created;
@@ -982,6 +994,7 @@ class omx_vdec: public qc_omx_component
 #ifdef _MSM8974_
         void send_codec_config();
 #endif
+        OMX_TICKS m_last_rendered_TS;
 };
 
 #ifdef _MSM8974_
